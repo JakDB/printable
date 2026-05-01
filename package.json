@@ -1,0 +1,28 @@
+{
+  "name": "rgb-to-cmyk-converter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "convert-server": "node server/start_icc_server.cjs",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vercel/analytics": "1.6.1",
+    "@vitejs/plugin-vue": "^6.0.6",
+    "jspdf": "^4.2.1",
+    "lucide-vue-next": "^1.0.0",
+    "vue": "^3.5.33",
+    "vue-router": "^5.0.6"
+  },
+  "devDependencies": {
+    "@vue/tsconfig": "^0.9.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.5",
+    "tailwindcss": "^3.4.17",
+    "typescript": "5.7.3",
+    "vite": "^8.0.10"
+  }
+}
