@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
+from email import policy
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from PIL import Image, ImageCms
+from PIL import Image, ImageCms, ImageDraw, ImageOps
 
 
 ROOT = Path(__file__).resolve().parents[1]
+MM_PER_INCH = 25.4
+CROP_LINE_MM = 0.25
 PROFILES = {
     "fogra51": {
         "label": "FOGRA51 / PSO Coated v3",
@@ -21,6 +26,34 @@ PROFILES = {
         "path": ROOT / "public" / "icc" / "JapanColor2011Coated" / "JapanColor2011Coated.icc",
     },
 }
+RENDERING_INTENTS = {
+    "perceptual": ImageCms.Intent.PERCEPTUAL,
+    "relative_colorimetric": ImageCms.Intent.RELATIVE_COLORIMETRIC,
+}
+
+
+def parse_float(value: str | None, label: str, *, minimum: float = 0) -> float:
+    if value is None:
+        raise ValueError(f"Missing {label}")
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label}") from exc
+    if parsed <= minimum:
+        raise ValueError(f"Invalid {label}")
+    return parsed
+
+
+def parse_int(value: str | None, label: str, *, minimum: int = 0) -> int:
+    if value is None:
+        raise ValueError(f"Missing {label}")
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label}") from exc
+    if parsed <= minimum:
+        raise ValueError(f"Invalid {label}")
+    return parsed
 
 
 def pdf_bytes(value: str) -> bytes:
@@ -119,16 +152,187 @@ def flatten_to_rgb(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
-def convert_to_cmyk_pdf(body: bytes, profile_key: str, page_width_mm: float, page_height_mm: float) -> bytes:
+def resolve_profile_options(profile_key: str, rendering_intent_key: str) -> tuple[dict[str, object], int, Path]:
     profile = PROFILES.get(profile_key)
     if not profile:
         raise ValueError("Unknown CMYK profile")
+    rendering_intent = RENDERING_INTENTS.get(rendering_intent_key)
+    if rendering_intent is None:
+        raise ValueError("Unknown rendering intent")
     profile_path = profile["path"]
-    if not profile_path.exists():
+    if not isinstance(profile_path, Path) or not profile_path.exists():
         raise FileNotFoundError(f"ICC profile not found: {profile_path}")
+    return profile, rendering_intent, profile_path
+
+
+def cover_resize(image: Image.Image, width: int, height: int) -> Image.Image:
+    source_ratio = image.width / image.height
+    target_ratio = width / height
+    left = 0.0
+    top = 0.0
+    right = float(image.width)
+    bottom = float(image.height)
+
+    if source_ratio > target_ratio:
+        crop_width = image.height * target_ratio
+        left = (image.width - crop_width) / 2
+        right = left + crop_width
+    else:
+        crop_height = image.width / target_ratio
+        top = (image.height - crop_height) / 2
+        bottom = top + crop_height
+
+    box = (
+        max(0, round(left)),
+        max(0, round(top)),
+        min(image.width, round(right)),
+        min(image.height, round(bottom)),
+    )
+    return image.crop(box).resize((width, height), Image.Resampling.LANCZOS)
+
+
+def create_bleed_artwork(source: Image.Image, width: int, height: int, print_width_mm: float, print_height_mm: float, bleed_mm: float) -> Image.Image:
+    page_width_mm = print_width_mm + bleed_mm * 2
+    page_height_mm = print_height_mm + bleed_mm * 2
+    bleed_x = max(1, round((bleed_mm / page_width_mm) * width))
+    bleed_y = max(1, round((bleed_mm / page_height_mm) * height))
+    trim_x = bleed_x
+    trim_y = bleed_y
+    trim_width = max(1, width - bleed_x * 2)
+    trim_height = max(1, height - bleed_y * 2)
+
+    artwork = Image.new("RGB", (width, height), "white")
+    trim = cover_resize(source, trim_width, trim_height)
+    artwork.paste(trim, (trim_x, trim_y))
+
+    left = artwork.crop((trim_x, trim_y, trim_x + bleed_x, trim_y + trim_height))
+    artwork.paste(ImageOps.mirror(left), (0, trim_y))
+
+    right = artwork.crop((trim_x + trim_width - bleed_x, trim_y, trim_x + trim_width, trim_y + trim_height))
+    artwork.paste(ImageOps.mirror(right), (trim_x + trim_width, trim_y))
+
+    top = artwork.crop((0, trim_y, width, trim_y + bleed_y))
+    artwork.paste(ImageOps.flip(top), (0, 0))
+
+    bottom = artwork.crop((0, trim_y + trim_height - bleed_y, width, trim_y + trim_height))
+    artwork.paste(ImageOps.flip(bottom), (0, trim_y + trim_height))
+
+    artwork.paste(trim, (trim_x, trim_y))
+    return artwork
+
+
+def draw_crop_marks(sheet: Image.Image, scale: float, bleed_mm: float, crop_mark_mm: float) -> None:
+    mark = max(1, round(crop_mark_mm * scale))
+    bleed_px = max(1, round(bleed_mm * scale))
+    line = max(1, round(CROP_LINE_MM * scale))
+    half_line = round(line / 2)
+    trim_left = mark + bleed_px
+    trim_top = mark + bleed_px
+    trim_right = sheet.width - mark - bleed_px
+    trim_bottom = sheet.height - mark - bleed_px
+    color = (38, 38, 38)
+    draw = ImageDraw.Draw(sheet)
+
+    draw.rectangle((0, trim_top - half_line, mark, trim_top - half_line + line - 1), fill=color)
+    draw.rectangle((sheet.width - mark, trim_top - half_line, sheet.width, trim_top - half_line + line - 1), fill=color)
+    draw.rectangle((0, trim_bottom - half_line, mark, trim_bottom - half_line + line - 1), fill=color)
+    draw.rectangle((sheet.width - mark, trim_bottom - half_line, sheet.width, trim_bottom - half_line + line - 1), fill=color)
+    draw.rectangle((trim_left - half_line, 0, trim_left - half_line + line - 1, mark), fill=color)
+    draw.rectangle((trim_right - half_line, 0, trim_right - half_line + line - 1, mark), fill=color)
+    draw.rectangle((trim_left - half_line, sheet.height - mark, trim_left - half_line + line - 1, sheet.height), fill=color)
+    draw.rectangle((trim_right - half_line, sheet.height - mark, trim_right - half_line + line - 1, sheet.height), fill=color)
+
+
+def create_print_sheet(
+    source: Image.Image,
+    print_width_mm: float,
+    print_height_mm: float,
+    dpi: int,
+    bleed_mm: float,
+    crop_mark_mm: float,
+) -> tuple[Image.Image, float, float]:
+    sheet_width_mm = print_width_mm + (bleed_mm + crop_mark_mm) * 2
+    sheet_height_mm = print_height_mm + (bleed_mm + crop_mark_mm) * 2
+    sheet_width = max(1, int((sheet_width_mm / MM_PER_INCH) * dpi + 0.999999))
+    sheet_height = max(1, int((sheet_height_mm / MM_PER_INCH) * dpi + 0.999999))
+    scale = sheet_width / sheet_width_mm
+    mark_px = max(1, round(crop_mark_mm * scale))
+    artwork_width = max(1, sheet_width - mark_px * 2)
+    artwork_height = max(1, sheet_height - mark_px * 2)
+
+    artwork = create_bleed_artwork(source, artwork_width, artwork_height, print_width_mm, print_height_mm, bleed_mm)
+    sheet = Image.new("RGB", (sheet_width, sheet_height), "white")
+    sheet.paste(artwork, (mark_px, mark_px))
+    draw_crop_marks(sheet, scale, bleed_mm, crop_mark_mm)
+    return sheet, sheet_width_mm, sheet_height_mm
+
+
+def convert_to_cmyk_pdf(
+    body: bytes,
+    profile_key: str,
+    print_width_mm: float,
+    print_height_mm: float,
+    dpi: int,
+    bleed_mm: float,
+    crop_mark_mm: float,
+    rendering_intent_key: str = "perceptual",
+) -> bytes:
+    profile, rendering_intent, profile_path = resolve_profile_options(profile_key, rendering_intent_key)
 
     with Image.open(io.BytesIO(body)) as image:
         source_icc = image.info.get("icc_profile")
+        image = ImageOps.exif_transpose(image)
+        rgb = flatten_to_rgb(image)
+
+    source_profile = (
+        ImageCms.ImageCmsProfile(io.BytesIO(source_icc))
+        if source_icc
+        else ImageCms.createProfile("sRGB")
+    )
+    sheet, sheet_width_mm, sheet_height_mm = create_print_sheet(
+        rgb,
+        print_width_mm,
+        print_height_mm,
+        dpi,
+        bleed_mm,
+        crop_mark_mm,
+    )
+    target_profile = ImageCms.ImageCmsProfile(str(profile_path))
+    flags = ImageCms.Flags.BLACKPOINTCOMPENSATION
+    cmyk = ImageCms.profileToProfile(
+        sheet,
+        source_profile,
+        target_profile,
+        renderingIntent=rendering_intent,
+        outputMode="CMYK",
+        flags=flags,
+    )
+    if cmyk is None:
+        raise RuntimeError("ICC transform failed")
+
+    return build_cmyk_pdf(
+        cmyk.tobytes(),
+        cmyk.width,
+        cmyk.height,
+        sheet_width_mm,
+        sheet_height_mm,
+        str(profile["label"]),
+        profile_path.read_bytes(),
+    )
+
+
+def convert_prepared_sheet_to_cmyk_pdf(
+    body: bytes,
+    profile_key: str,
+    page_width_mm: float,
+    page_height_mm: float,
+    rendering_intent_key: str = "perceptual",
+) -> bytes:
+    profile, rendering_intent, profile_path = resolve_profile_options(profile_key, rendering_intent_key)
+
+    with Image.open(io.BytesIO(body)) as image:
+        source_icc = image.info.get("icc_profile")
+        image = ImageOps.exif_transpose(image)
         rgb = flatten_to_rgb(image)
 
     source_profile = (
@@ -137,14 +341,13 @@ def convert_to_cmyk_pdf(body: bytes, profile_key: str, page_width_mm: float, pag
         else ImageCms.createProfile("sRGB")
     )
     target_profile = ImageCms.ImageCmsProfile(str(profile_path))
-    flags = ImageCms.Flags.BLACKPOINTCOMPENSATION
     cmyk = ImageCms.profileToProfile(
         rgb,
         source_profile,
         target_profile,
-        renderingIntent=ImageCms.Intent.PERCEPTUAL,
+        renderingIntent=rendering_intent,
         outputMode="CMYK",
-        flags=flags,
+        flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
     )
     if cmyk is None:
         raise RuntimeError("ICC transform failed")
@@ -160,8 +363,33 @@ def convert_to_cmyk_pdf(body: bytes, profile_key: str, page_width_mm: float, pag
     )
 
 
+def parse_multipart_form(content_type: str, body: bytes) -> tuple[dict[str, str], bytes]:
+    message = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii") + body
+    )
+    if not message.is_multipart():
+        raise ValueError("Expected multipart form data")
+
+    fields: dict[str, str] = {}
+    image_bytes: bytes | None = None
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+        name = part.get_param("name", header="content-disposition")
+        payload = part.get_payload(decode=True) or b""
+        if name == "image":
+            image_bytes = payload
+        elif name:
+            charset = part.get_content_charset() or "utf-8"
+            fields[name] = payload.decode(charset, "replace")
+
+    if not image_bytes:
+        raise ValueError("Missing image")
+    return fields, image_bytes
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ICCConvert/1.0"
+    server_version = "ICCConvert/2.0"
 
     def end_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -178,7 +406,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"ok":true}')
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "version": "2.0",
+                        "supportsOriginalImagePdf": True,
+                    }
+                ).encode("utf-8")
+            )
             return
         self.send_error(404)
 
@@ -196,14 +432,39 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Image is too large")
 
             params = parse_qs(parsed.query)
-            profile = params.get("profile", ["fogra51"])[0]
-            page_width_mm = float(params.get("pageWidthMm", ["0"])[0])
-            page_height_mm = float(params.get("pageHeightMm", ["0"])[0])
-            if page_width_mm <= 0 or page_height_mm <= 0:
-                raise ValueError("Invalid page size")
-
+            content_type = self.headers.get("Content-Type", "")
             body = self.rfile.read(length)
-            pdf = convert_to_cmyk_pdf(body, profile, page_width_mm, page_height_mm)
+            if content_type.startswith("multipart/form-data"):
+                fields, image_body = parse_multipart_form(content_type, body)
+                profile = fields.get("profile", "fogra51")
+                print_width_mm = parse_float(fields.get("printWidthMm"), "print width")
+                print_height_mm = parse_float(fields.get("printHeightMm"), "print height")
+                dpi = parse_int(fields.get("dpi"), "DPI")
+                bleed_mm = parse_float(fields.get("bleedMm"), "bleed", minimum=-0.000001)
+                crop_mark_mm = parse_float(fields.get("cropMarkMm"), "crop mark", minimum=-0.000001)
+                rendering_intent = fields.get("renderingIntent", "perceptual")
+                pdf = convert_to_cmyk_pdf(
+                    image_body,
+                    profile,
+                    print_width_mm,
+                    print_height_mm,
+                    dpi,
+                    bleed_mm,
+                    crop_mark_mm,
+                    rendering_intent,
+                )
+            else:
+                profile = params.get("profile", ["fogra51"])[0]
+                page_width_mm = parse_float(params.get("pageWidthMm", ["0"])[0], "page width")
+                page_height_mm = parse_float(params.get("pageHeightMm", ["0"])[0], "page height")
+                rendering_intent = params.get("renderingIntent", ["perceptual"])[0]
+                pdf = convert_prepared_sheet_to_cmyk_pdf(
+                    body,
+                    profile,
+                    page_width_mm,
+                    page_height_mm,
+                    rendering_intent,
+                )
             self.send_response(200)
             self.send_header("Content-Type", "application/pdf")
             self.send_header("Content-Disposition", 'attachment; filename="printable-cmyk.pdf"')

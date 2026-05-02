@@ -15,6 +15,7 @@ interface UploadedFile {
 }
 
 type PrintProfileKey = 'fogra51' | 'japan2011'
+type RenderingIntentKey = 'perceptual' | 'relative_colorimetric'
 
 interface PrintProfile {
   key: PrintProfileKey
@@ -28,6 +29,12 @@ interface PrintProfile {
   neutralGcr: number
   blackStart: number
   gamutCompression: number
+}
+
+interface RenderingIntentOption {
+  key: RenderingIntentKey
+  label: string
+  help: string
 }
 
 const A4_WIDTH_MM = 210
@@ -66,6 +73,18 @@ const PRINT_PROFILES: Record<PrintProfileKey, PrintProfile> = {
     gamutCompression: 0.035
   }
 }
+const RENDERING_INTENTS: Record<RenderingIntentKey, RenderingIntentOption> = {
+  perceptual: {
+    key: 'perceptual',
+    label: '感知法',
+    help: '推荐用于 AI 图、照片、插画和高饱和图片，会优先保持整体观感和渐变关系。'
+  },
+  relative_colorimetric: {
+    key: 'relative_colorimetric',
+    label: '相对比色法',
+    help: '适合产品图、品牌色等更重视准确色的图片；超出印刷色域的颜色可能被直接压到边界。'
+  }
+}
 
 const files = ref<UploadedFile[]>([])
 const isDragging = ref(false)
@@ -81,12 +100,14 @@ const bleed = ref(DEFAULT_BLEED_MM)
 const lockAspectRatio = ref(true)
 const bleedPreview = ref('')
 const selectedPrintProfile = ref<PrintProfileKey>('fogra51')
+const selectedRenderingIntent = ref<RenderingIntentKey>('perceptual')
 const CMYK_API_URL = 'http://127.0.0.1:8787/api/convert-cmyk-pdf'
 
 const selectedFile = computed(() => files.value[0])
 const hasFiles = computed(() => Boolean(selectedFile.value))
 const allDone = computed(() => Boolean(selectedFile.value && selectedFile.value.status === 'done'))
 const activePrintProfile = computed(() => PRINT_PROFILES[selectedPrintProfile.value])
+const activeRenderingIntent = computed(() => RENDERING_INTENTS[selectedRenderingIntent.value])
 const hasGeneratedPdf = computed(() => Boolean(generatedPdf.value))
 const aspectRatio = computed(() => {
   const file = selectedFile.value
@@ -883,7 +904,7 @@ async function startConversion() {
     generatedPdf.value = await createCmykPdfBlob(file)
     generatedPdfProfile.value = selectedPrintProfile.value
     file.status = 'done'
-  } catch {
+  } catch (error) {
     file.status = 'error'
     const detail = error instanceof Error ? error.message : ''
     if (detail) {
@@ -898,30 +919,50 @@ async function startConversion() {
 }
 
 async function createCmykPdfBlob(file: UploadedFile) {
-  const pageWidth = printWidth.value + (bleed.value + CROP_MARK_MM) * 2
-  const pageHeight = printHeight.value + (bleed.value + CROP_MARK_MM) * 2
-  const canvas = await createPrintSheetCanvasAtDpi(file.preview)
-  const sheetBlob = await canvasToJpegBlob(canvas)
-  const params = new URLSearchParams({
-    profile: selectedPrintProfile.value,
-    pageWidthMm: String(pageWidth),
-    pageHeightMm: String(pageHeight)
-  })
-  const response = await fetch(`${CMYK_API_URL}?${params}`, {
+  await ensureCmykServiceReady()
+
+  const formData = new FormData()
+  formData.append('image', file.file, file.file.name)
+  formData.append('profile', selectedPrintProfile.value)
+  formData.append('renderingIntent', selectedRenderingIntent.value)
+  formData.append('printWidthMm', String(printWidth.value))
+  formData.append('printHeightMm', String(printHeight.value))
+  formData.append('dpi', String(printDpi.value))
+  formData.append('bleedMm', String(bleed.value))
+  formData.append('cropMarkMm', String(CROP_MARK_MM))
+
+  const response = await fetch(CMYK_API_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'image/jpeg' },
-    body: sheetBlob
+    body: formData
   })
 
   if (!response.ok) {
     const message = await response.text().catch(() => '')
+    if (message.includes('Invalid page size')) {
+      throw new Error('本地 CMYK 转换服务仍是旧版本，请停止后重新运行 npm.cmd run convert-server。')
+    }
     throw new Error(message || 'ICC CMYK 转换服务不可用')
   }
 
   return response.blob()
 }
 
+async function ensureCmykServiceReady() {
+  try {
+    const healthUrl = CMYK_API_URL.replace('/api/convert-cmyk-pdf', '/health')
+    const response = await fetch(healthUrl, { cache: 'no-store' })
+    const status = await response.json()
+    if (!status?.supportsOriginalImagePdf) {
+      throw new Error('本地 CMYK 转换服务仍是旧版本，请停止后重新运行 npm.cmd run convert-server。')
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('旧版本')) throw error
+    throw new Error('无法连接本地 CMYK 转换服务，请确认 npm.cmd run convert-server 正在运行。')
+  }
+}
+
 function downloadPDF() {
+  if (isConverting.value) return
   if (!generatedPdf.value) {
     conversionError.value = '请先生成 PDF 文件，再下载。'
     return
@@ -948,7 +989,7 @@ async function downloadPrintImage() {
 }
 
 watch(
-  [selectedFile, printWidth, printHeight, printDpi, bleed, selectedPrintProfile],
+  [selectedFile, printWidth, printHeight, printDpi, bleed, selectedPrintProfile, selectedRenderingIntent],
   () => {
     if (!isConverting.value) {
       generatedPdf.value = null
@@ -997,7 +1038,7 @@ watch(
           </div>
           <div>
             <p class="text-lg font-medium text-foreground">
-              拖拽图片到此处，或点击上传
+              拖拽RGB图片到此处，或点击上传
             </p>
             <p class="mt-1 text-sm text-muted-foreground">
               支持 PNG、JPG 格式
@@ -1146,6 +1187,28 @@ watch(
               </span>
             </label>
 
+            <label class="mt-4 block">
+              <span class="text-sm font-medium text-foreground">渲染意图</span>
+              <select
+                v-model="selectedRenderingIntent"
+                class="mt-2 w-full rounded-xl border border-border bg-background px-4 py-3 text-foreground outline-none focus:border-primary"
+              >
+                <option
+                  v-for="intent in RENDERING_INTENTS"
+                  :key="intent.key"
+                  :value="intent.key"
+                >
+                  {{ intent.label }}
+                </option>
+              </select>
+              <span class="mt-2 block text-xs text-muted-foreground">
+                {{ activeRenderingIntent.help }}
+              </span>
+              <span class="mt-1 block text-xs text-muted-foreground">
+                源 RGB 会优先使用原图嵌入 ICC；没有 ICC 时按 sRGB 处理。
+              </span>
+            </label>
+
             <div class="mt-5 rounded-xl bg-secondary p-4 text-sm text-muted-foreground">
               成品区域像素需求：{{ requiredPixels.width }} x {{ requiredPixels.height }} px
               <span class="block mt-1">导出文件像素：{{ outputPixels.width }} x {{ outputPixels.height }} px，包含 {{ bleed }}mm 出血和裁切参考线。</span>
@@ -1230,14 +1293,14 @@ watch(
           </template>
           <template v-else>
             <FileImage class="w-5 h-5" />
-            转换成PDF文件
+            转换为CMYK文件
           </template>
         </button>
 
         <button
           @click="downloadPDF"
           :disabled="!hasGeneratedPdf || isConverting"
-          class="btn-primary bg-accent text-accent-foreground px-8 py-4 rounded-xl text-base font-medium flex items-center gap-2 w-full sm:w-auto justify-center"
+          class="btn-primary bg-accent text-accent-foreground px-8 py-4 rounded-xl text-base font-medium flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed w-full sm:w-auto justify-center"
         >
           <Download class="w-5 h-5" />
           下载 PDF 文件
