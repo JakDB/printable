@@ -4,11 +4,20 @@ import io
 import json
 import os
 import sys
+import base64
+import hashlib
+import hmac
+import subprocess
+import threading
+import uuid
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from PIL import Image, ImageCms, ImageDraw, ImageOps
 
@@ -30,6 +39,17 @@ RENDERING_INTENTS = {
     "perceptual": ImageCms.Intent.PERCEPTUAL,
     "relative_colorimetric": ImageCms.Intent.RELATIVE_COLORIMETRIC,
 }
+APIXO_BASE_URL = os.environ.get("APIXO_BASE_URL", "https://api.apixo.ai").rstrip("/")
+APIXO_MODEL = os.environ.get("APIXO_IMAGE_MODEL", "gpt-image-2")
+APIXO_API_KEY = os.environ.get("APIXO_API_KEY", "")
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT") or os.environ.get("S3_ENDPOINT", "")
+MINIO_PUBLIC_URL = os.environ.get("MINIO_PUBLIC_URL", "").rstrip("/")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY") or os.environ.get("S3_ACCESS_KEY_ID", "")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY") or os.environ.get("S3_SECRET_ACCESS_KEY", "")
+MINIO_BUCKET = os.environ.get("MINIO_BUCKET") or os.environ.get("S3_BUCKET", "")
+MINIO_REGION = os.environ.get("MINIO_REGION") or os.environ.get("S3_REGION", "us-east-1")
+MINIO_FORCE_PATH_STYLE = os.environ.get("S3_FORCE_PATH_STYLE", "true").lower() != "false"
+MINIO_TEMP_IMAGE_TTL_SECONDS = int(os.environ.get("MINIO_TEMP_IMAGE_TTL_SECONDS", "3600"))
 
 
 def parse_float(value: str | None, label: str, *, minimum: float = 0) -> float:
@@ -191,7 +211,31 @@ def cover_resize(image: Image.Image, width: int, height: int) -> Image.Image:
     return image.crop(box).resize((width, height), Image.Resampling.LANCZOS)
 
 
-def create_bleed_artwork(source: Image.Image, width: int, height: int, print_width_mm: float, print_height_mm: float, bleed_mm: float) -> Image.Image:
+def contain_resize(image: Image.Image, width: int, height: int) -> Image.Image:
+    source_ratio = image.width / image.height
+    target_ratio = width / height
+    if source_ratio >= target_ratio:
+        resized_width = width
+        resized_height = max(1, round(width / source_ratio))
+    else:
+        resized_height = height
+        resized_width = max(1, round(height * source_ratio))
+
+    resized = image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+    artwork = Image.new("RGB", (width, height), "white")
+    artwork.paste(resized, ((width - resized_width) // 2, (height - resized_height) // 2))
+    return artwork
+
+
+def create_bleed_artwork(
+    source: Image.Image,
+    width: int,
+    height: int,
+    print_width_mm: float,
+    print_height_mm: float,
+    bleed_mm: float,
+    bleed_source: Image.Image | None = None,
+) -> Image.Image:
     page_width_mm = print_width_mm + bleed_mm * 2
     page_height_mm = print_height_mm + bleed_mm * 2
     bleed_x = max(1, round((bleed_mm / page_width_mm) * width))
@@ -201,23 +245,13 @@ def create_bleed_artwork(source: Image.Image, width: int, height: int, print_wid
     trim_width = max(1, width - bleed_x * 2)
     trim_height = max(1, height - bleed_y * 2)
 
-    artwork = Image.new("RGB", (width, height), "white")
+    artwork = contain_resize(bleed_source, width, height) if bleed_source else cover_resize(source, width, height)
+    if bleed_source:
+        return artwork
+
     trim = cover_resize(source, trim_width, trim_height)
     artwork.paste(trim, (trim_x, trim_y))
 
-    left = artwork.crop((trim_x, trim_y, trim_x + bleed_x, trim_y + trim_height))
-    artwork.paste(ImageOps.mirror(left), (0, trim_y))
-
-    right = artwork.crop((trim_x + trim_width - bleed_x, trim_y, trim_x + trim_width, trim_y + trim_height))
-    artwork.paste(ImageOps.mirror(right), (trim_x + trim_width, trim_y))
-
-    top = artwork.crop((0, trim_y, width, trim_y + bleed_y))
-    artwork.paste(ImageOps.flip(top), (0, 0))
-
-    bottom = artwork.crop((0, trim_y + trim_height - bleed_y, width, trim_y + trim_height))
-    artwork.paste(ImageOps.flip(bottom), (0, trim_y + trim_height))
-
-    artwork.paste(trim, (trim_x, trim_y))
     return artwork
 
 
@@ -250,6 +284,7 @@ def create_print_sheet(
     dpi: int,
     bleed_mm: float,
     crop_mark_mm: float,
+    bleed_source: Image.Image | None = None,
 ) -> tuple[Image.Image, float, float]:
     sheet_width_mm = print_width_mm + (bleed_mm + crop_mark_mm) * 2
     sheet_height_mm = print_height_mm + (bleed_mm + crop_mark_mm) * 2
@@ -260,7 +295,7 @@ def create_print_sheet(
     artwork_width = max(1, sheet_width - mark_px * 2)
     artwork_height = max(1, sheet_height - mark_px * 2)
 
-    artwork = create_bleed_artwork(source, artwork_width, artwork_height, print_width_mm, print_height_mm, bleed_mm)
+    artwork = create_bleed_artwork(source, artwork_width, artwork_height, print_width_mm, print_height_mm, bleed_mm, bleed_source)
     sheet = Image.new("RGB", (sheet_width, sheet_height), "white")
     sheet.paste(artwork, (mark_px, mark_px))
     draw_crop_marks(sheet, scale, bleed_mm, crop_mark_mm)
@@ -276,6 +311,7 @@ def convert_to_cmyk_pdf(
     bleed_mm: float,
     crop_mark_mm: float,
     rendering_intent_key: str = "perceptual",
+    bleed_body: bytes | None = None,
 ) -> bytes:
     profile, rendering_intent, profile_path = resolve_profile_options(profile_key, rendering_intent_key)
 
@@ -283,6 +319,12 @@ def convert_to_cmyk_pdf(
         source_icc = image.info.get("icc_profile")
         image = ImageOps.exif_transpose(image)
         rgb = flatten_to_rgb(image)
+
+    bleed_rgb = None
+    if bleed_body:
+        with Image.open(io.BytesIO(bleed_body)) as bleed_image:
+            bleed_image = ImageOps.exif_transpose(bleed_image)
+            bleed_rgb = flatten_to_rgb(bleed_image)
 
     source_profile = (
         ImageCms.ImageCmsProfile(io.BytesIO(source_icc))
@@ -296,6 +338,7 @@ def convert_to_cmyk_pdf(
         dpi,
         bleed_mm,
         crop_mark_mm,
+        bleed_rgb,
     )
     target_profile = ImageCms.ImageCmsProfile(str(profile_path))
     flags = ImageCms.Flags.BLACKPOINTCOMPENSATION
@@ -363,7 +406,7 @@ def convert_prepared_sheet_to_cmyk_pdf(
     )
 
 
-def parse_multipart_form(content_type: str, body: bytes) -> tuple[dict[str, str], bytes]:
+def parse_multipart_form(content_type: str, body: bytes) -> tuple[dict[str, str], bytes, bytes | None]:
     message = BytesParser(policy=policy.default).parsebytes(
         f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii") + body
     )
@@ -372,6 +415,7 @@ def parse_multipart_form(content_type: str, body: bytes) -> tuple[dict[str, str]
 
     fields: dict[str, str] = {}
     image_bytes: bytes | None = None
+    bleed_image_bytes: bytes | None = None
     for part in message.iter_parts():
         if part.get_content_disposition() != "form-data":
             continue
@@ -379,13 +423,349 @@ def parse_multipart_form(content_type: str, body: bytes) -> tuple[dict[str, str]
         payload = part.get_payload(decode=True) or b""
         if name == "image":
             image_bytes = payload
+        elif name == "bleedImage":
+            bleed_image_bytes = payload
         elif name:
             charset = part.get_content_charset() or "utf-8"
             fields[name] = payload.decode(charset, "replace")
 
     if not image_bytes:
         raise ValueError("Missing image")
-    return fields, image_bytes
+    return fields, image_bytes, bleed_image_bytes
+
+
+def read_json_body(handler: BaseHTTPRequestHandler, *, limit_mb: int = 50) -> dict[str, object]:
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length <= 0:
+        raise ValueError("Empty request body")
+    if length > limit_mb * 1024 * 1024:
+        raise ValueError("Request body is too large")
+    raw = handler.rfile.read(length)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("Invalid JSON request body") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Expected JSON object")
+    return data
+
+
+def apixo_request(path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+    if not APIXO_API_KEY:
+        raise RuntimeError("Missing APIXO_API_KEY")
+
+    command = [
+        "curl",
+        "-sS",
+        "--fail-with-body",
+        "-H",
+        f"Authorization: Bearer {APIXO_API_KEY}",
+    ]
+    if payload is not None:
+        command.extend([
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            json.dumps(payload),
+        ])
+    command.append(f"{APIXO_BASE_URL}{path}")
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("APIXO request timed out") from exc
+    if result.returncode != 0:
+        detail = result.stdout.strip() or result.stderr.strip()
+        raise RuntimeError(f"APIXO request failed: {detail}")
+
+    response_body = result.stdout.encode("utf-8")
+    try:
+        decoded = json.loads(response_body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("APIXO returned invalid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise RuntimeError("APIXO returned unexpected response")
+    return decoded
+
+
+def parse_image_data_url(image_data_url: str) -> tuple[bytes, str, str]:
+    if not image_data_url.startswith("data:image/"):
+        raise ValueError("Missing source image")
+
+    header, _, encoded = image_data_url.partition(",")
+    if not encoded or ";base64" not in header:
+        raise ValueError("Expected base64 image data URL")
+
+    content_type = header[5:].split(";")[0]
+    extension = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+    }.get(content_type, "png")
+    try:
+        body = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise ValueError("Invalid base64 image data") from exc
+    if not body:
+        raise ValueError("Empty image data")
+    return body, content_type, extension
+
+
+def aws_signing_key(secret_key: str, date_stamp: str, region: str) -> bytes:
+    date_key = hmac.new(("AWS4" + secret_key).encode("utf-8"), date_stamp.encode("utf-8"), hashlib.sha256).digest()
+    region_key = hmac.new(date_key, region.encode("utf-8"), hashlib.sha256).digest()
+    service_key = hmac.new(region_key, b"s3", hashlib.sha256).digest()
+    return hmac.new(service_key, b"aws4_request", hashlib.sha256).digest()
+
+
+def s3_encode_key(key: str) -> str:
+    return "/".join(quote(part, safe="") for part in key.split("/"))
+
+
+def build_minio_request(method: str, bucket: str, key: str, body: bytes, content_type: str, query: str = "") -> Request:
+    if not all([MINIO_ENDPOINT, MINIO_PUBLIC_URL, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET]):
+        raise RuntimeError("Missing MinIO environment configuration")
+
+    endpoint = MINIO_ENDPOINT.rstrip("/")
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise RuntimeError("Invalid MinIO endpoint")
+
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    encoded_key = s3_encode_key(key)
+    payload_hash = hashlib.sha256(body).hexdigest()
+
+    if MINIO_FORCE_PATH_STYLE:
+        host = parsed.netloc
+        canonical_uri = f"/{quote(bucket, safe='')}"
+        if encoded_key:
+            canonical_uri += f"/{encoded_key}"
+        upload_url = f"{parsed.scheme}://{host}{canonical_uri}"
+    else:
+        host = f"{bucket}.{parsed.netloc}"
+        canonical_uri = f"/{encoded_key}" if encoded_key else "/"
+        upload_url = f"{parsed.scheme}://{host}{canonical_uri}"
+    canonical_query = query
+    if query:
+        upload_url = f"{upload_url}?{query}"
+
+    canonical_headers = (
+        f"content-type:{content_type}\n"
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+    canonical_request = "\n".join([
+        method,
+        canonical_uri,
+        canonical_query,
+        canonical_headers,
+        signed_headers,
+        payload_hash,
+    ])
+    credential_scope = f"{date_stamp}/{MINIO_REGION}/s3/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256",
+        amz_date,
+        credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+    signature = hmac.new(
+        aws_signing_key(MINIO_SECRET_KEY, date_stamp, MINIO_REGION),
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    authorization = (
+        "AWS4-HMAC-SHA256 "
+        f"Credential={MINIO_ACCESS_KEY}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, "
+        f"Signature={signature}"
+    )
+
+    return Request(
+        upload_url,
+        data=body,
+        headers={
+            "Authorization": authorization,
+            "Content-Type": content_type,
+            "Host": host,
+            "X-Amz-Content-Sha256": payload_hash,
+            "X-Amz-Date": amz_date,
+        },
+        method=method,
+    )
+
+
+def ensure_minio_bucket() -> None:
+    request = build_minio_request("PUT", MINIO_BUCKET, "", b"", "application/octet-stream")
+    try:
+        with urlopen(request, timeout=60):
+            return
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        if exc.code == 409 and ("BucketAlready" in detail or "BucketAlreadyOwnedByYou" in detail):
+            return
+        raise RuntimeError(f"MinIO bucket check failed with status {exc.code}: {detail}") from exc
+
+
+def ensure_minio_bucket_public() -> None:
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": ["*"]},
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{MINIO_BUCKET}/*"],
+            }
+        ],
+    }
+    body = json.dumps(policy, separators=(",", ":")).encode("utf-8")
+    request = build_minio_request("PUT", MINIO_BUCKET, "", body, "application/json", "policy=")
+    try:
+        with urlopen(request, timeout=60):
+            return
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"MinIO public policy failed with status {exc.code}: {detail}") from exc
+
+
+def minio_public_object_url(base_url: str, key: str) -> str:
+    return f"{base_url.rstrip('/')}/{quote(MINIO_BUCKET, safe='')}/{s3_encode_key(key)}"
+
+
+def minio_endpoint_public_url(key: str) -> str:
+    endpoint = MINIO_ENDPOINT.rstrip("/")
+    parsed = urlparse(endpoint)
+    if MINIO_FORCE_PATH_STYLE:
+        return minio_public_object_url(endpoint, key)
+    return f"{parsed.scheme}://{MINIO_BUCKET}.{parsed.netloc}/{s3_encode_key(key)}"
+
+
+def is_public_image_url(url: str) -> bool:
+    try:
+        request = Request(url, method="HEAD")
+        with urlopen(request, timeout=20) as response:
+            content_type = response.headers.get("Content-Type", "")
+            return response.status < 400 and content_type.startswith("image/")
+    except Exception:
+        return False
+
+
+def delete_minio_object(key: str) -> None:
+    request = build_minio_request("DELETE", MINIO_BUCKET, key, b"", "application/octet-stream")
+    try:
+        with urlopen(request, timeout=60) as response:
+            if response.status >= 300:
+                raise RuntimeError(f"MinIO delete failed with status {response.status}")
+    except HTTPError as exc:
+        if exc.code == 404:
+            return
+        detail = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"MinIO delete failed with status {exc.code}: {detail}") from exc
+
+
+def schedule_minio_delete(key: str) -> None:
+    if MINIO_TEMP_IMAGE_TTL_SECONDS <= 0:
+        return
+
+    def delete_later() -> None:
+        try:
+            delete_minio_object(key)
+            sys.stderr.write(f"Deleted temporary MinIO image after TTL: {key}\n")
+        except Exception as exc:
+            sys.stderr.write(f"Failed to delete temporary MinIO image {key}: {exc}\n")
+
+    timer = threading.Timer(MINIO_TEMP_IMAGE_TTL_SECONDS, delete_later)
+    timer.daemon = True
+    timer.start()
+
+
+def upload_to_minio(body: bytes, content_type: str, extension: str) -> str:
+    now = datetime.now(timezone.utc)
+    key = f"upscale/{now.strftime('%Y%m%d')}/{uuid.uuid4().hex}.{extension}"
+    ensure_minio_bucket()
+    ensure_minio_bucket_public()
+
+    request = build_minio_request("PUT", MINIO_BUCKET, key, body, content_type)
+    try:
+        with urlopen(request, timeout=60) as response:
+            if response.status >= 300:
+                raise RuntimeError(f"MinIO upload failed with status {response.status}")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"MinIO upload failed with status {exc.code}: {detail}") from exc
+
+    schedule_minio_delete(key)
+
+    configured_url = minio_public_object_url(MINIO_PUBLIC_URL, key)
+    if is_public_image_url(configured_url):
+        return configured_url
+
+    fallback_url = minio_endpoint_public_url(key)
+    if is_public_image_url(fallback_url):
+        return fallback_url
+
+    return configured_url
+
+
+def start_apixo_upscale(
+    image_data_url: str,
+    resolution: str,
+    prompt: str | None = None,
+    aspect_ratio: str | None = None,
+) -> dict[str, object]:
+    if resolution not in ("2k", "4k"):
+        raise ValueError("Resolution must be 2k or 4k")
+
+    resolution_label = resolution.upper()
+    image_body, content_type, extension = parse_image_data_url(image_data_url)
+    image_url = upload_to_minio(image_body, content_type, extension)
+    supported_aspect_ratios = {"auto", "1:1", "3:4", "4:3", "9:16", "16:9"}
+    if aspect_ratio not in supported_aspect_ratios:
+        aspect_ratio = "auto"
+    payload = {
+        "request_type": "async",
+        "provider": "auto",
+        "input": {
+            "mode": "image-to-image",
+            "prompt": prompt or f"The resolution of the current image has been changed to {resolution_label}; other settings remain unchanged.",
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "image_urls": [image_url],
+        },
+    }
+    return apixo_request(f"/api/v1/generateTask/{APIXO_MODEL}", payload)
+
+
+def get_apixo_status(task_id: str) -> dict[str, object]:
+    if not task_id:
+        raise ValueError("Missing taskId")
+    return apixo_request(f"/api/v1/statusTask/{APIXO_MODEL}?taskId={task_id}")
+
+
+def fetch_remote_image(url: str) -> tuple[bytes, str]:
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("Only HTTPS image URLs are supported")
+
+    request = Request(url, headers={"User-Agent": "Printable/1.0"})
+    with urlopen(request, timeout=60) as response:
+        content_type = response.headers.get("Content-Type", "image/png").split(";")[0]
+        if not content_type.startswith("image/"):
+            raise ValueError("Remote URL did not return an image")
+        return response.read(), content_type
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -393,7 +773,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def end_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         super().end_headers()
 
@@ -402,7 +782,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        if urlparse(self.path).path == "/health":
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -412,14 +793,84 @@ class Handler(BaseHTTPRequestHandler):
                         "ok": True,
                         "version": "2.0",
                         "supportsOriginalImagePdf": True,
+                        "supportsImageUpscale": True,
                     }
                 ).encode("utf-8")
             )
             return
+
+        if parsed.path == "/api/upscale-status":
+            try:
+                params = parse_qs(parsed.query)
+                task_id = params.get("taskId", [""])[0]
+                payload = json.dumps(get_apixo_status(task_id)).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as exc:
+                message = str(exc).encode("utf-8", "replace")
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(message)))
+                self.end_headers()
+                self.wfile.write(message)
+            return
+
+        if parsed.path == "/api/proxy-image":
+            try:
+                params = parse_qs(parsed.query)
+                url = params.get("url", [""])[0]
+                image, content_type = fetch_remote_image(url)
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(image)))
+                self.end_headers()
+                self.wfile.write(image)
+            except Exception as exc:
+                message = str(exc).encode("utf-8", "replace")
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(message)))
+                self.end_headers()
+                self.wfile.write(message)
+            return
+
         self.send_error(404)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/upscale-image":
+            try:
+                data = read_json_body(self)
+                image_data_url = data.get("imageDataUrl")
+                resolution = data.get("resolution")
+                prompt = data.get("prompt")
+                aspect_ratio = data.get("aspectRatio")
+                if not isinstance(image_data_url, str):
+                    raise ValueError("Missing imageDataUrl")
+                if not isinstance(resolution, str):
+                    raise ValueError("Missing resolution")
+                if prompt is not None and not isinstance(prompt, str):
+                    raise ValueError("Invalid prompt")
+                if aspect_ratio is not None and not isinstance(aspect_ratio, str):
+                    raise ValueError("Invalid aspectRatio")
+                payload = json.dumps(start_apixo_upscale(image_data_url, resolution, prompt, aspect_ratio)).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as exc:
+                message = str(exc).encode("utf-8", "replace")
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(message)))
+                self.end_headers()
+                self.wfile.write(message)
+            return
+
         if parsed.path != "/api/convert-cmyk-pdf":
             self.send_error(404)
             return
@@ -435,7 +886,7 @@ class Handler(BaseHTTPRequestHandler):
             content_type = self.headers.get("Content-Type", "")
             body = self.rfile.read(length)
             if content_type.startswith("multipart/form-data"):
-                fields, image_body = parse_multipart_form(content_type, body)
+                fields, image_body, bleed_image_body = parse_multipart_form(content_type, body)
                 profile = fields.get("profile", "fogra51")
                 print_width_mm = parse_float(fields.get("printWidthMm"), "print width")
                 print_height_mm = parse_float(fields.get("printHeightMm"), "print height")
@@ -452,6 +903,7 @@ class Handler(BaseHTTPRequestHandler):
                     bleed_mm,
                     crop_mark_mm,
                     rendering_intent,
+                    bleed_image_body,
                 )
             else:
                 profile = params.get("profile", ["fogra51"])[0]
