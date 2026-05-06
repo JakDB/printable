@@ -6,9 +6,9 @@ Printable 是一个用于印刷交付的 RGB 到 CMYK 转换工具。它可以�
 
 - 上传 PNG/JPG 图片并读取图片尺寸和 DPI 元数据。
 - 设置成品宽高、DPI、出血尺寸和印刷 ICC 配置。
-- 自动生成镜像出血，避免裁切后边缘露白。
+- 支持通过 AI 智能扩图生成出血区域，避免裁切后边缘露白。
 - 在出血区域外绘制裁切参考线。
-- 支持导出高清印刷图片。
+- 支持生成 2K/4K 高清印刷图片。
 - 支持生成 CMYK PDF，当前内置：
   - FOGRA51 / PSO Coated v3
   - Japan Color 2011 Coated
@@ -56,6 +56,28 @@ pnpm install
 ```
 
 ## 本地开发
+
+复制环境变量示例文件，并填写 APIXO 与 MinIO/S3 的真实配置：
+
+```bash
+cp .env.example .env.local
+```
+
+`npm.cmd run convert-server` 会自动读取 `.env.local` 和 `.env`。真实密钥不要提交到 Git 仓库。
+
+AI 图片增强和 AI 智能扩图需要这些环境变量：
+
+```text
+APIXO_API_KEY
+MINIO_ENDPOINT
+MINIO_PUBLIC_URL
+MINIO_ACCESS_KEY
+MINIO_SECRET_KEY
+MINIO_BUCKET
+MINIO_REGION
+MINIO_TEMP_IMAGE_TTL_SECONDS
+S3_FORCE_PATH_STYLE
+```
 
 启动前端开发服务：
 
