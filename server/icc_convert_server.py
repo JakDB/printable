@@ -735,12 +735,22 @@ def start_apixo_upscale(
     supported_aspect_ratios = {"auto", "1:1", "3:4", "4:3", "9:16", "16:9"}
     if aspect_ratio not in supported_aspect_ratios:
         aspect_ratio = "auto"
+    fallback_prompt = " ".join(
+        [
+            f"将当前图片分辨度提升到 {resolution_label}。",
+            "不要扩图，保持原图比例生图。",
+            "必须保持原图完整画面、原图边界、原图裁切范围、原图构图和主体位置完全不变。",
+            "不要横向拉伸，不要纵向拉伸，不要压扁人物，不要改变人物比例。",
+            "不要向左、右、上、下增加任何新内容，不要添加边框、白边、背景或画布外延。",
+            "只提升细节、锐度、质感和印刷分辨率。",
+        ]
+    )
     payload = {
         "request_type": "async",
         "provider": "auto",
         "input": {
             "mode": "image-to-image",
-            "prompt": prompt or f"The resolution of the current image has been changed to {resolution_label}; other settings remain unchanged.",
+            "prompt": prompt or fallback_prompt,
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
             "image_urls": [image_url],

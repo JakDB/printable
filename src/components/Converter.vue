@@ -564,7 +564,7 @@ async function createBleedCanvas(source: string, width: number, height: number, 
   ctx.fillStyle = '#ffffff'
   ctx.fillRect(0, 0, width, height)
   if (bleedImg) {
-    drawContain(ctx, bleedImg, 0, 0, width, height, bleedImg.naturalWidth, bleedImg.naturalHeight)
+    ctx.drawImage(bleedImg, 0, 0, width, height)
     return canvas
   } else {
     drawCover(ctx, img, 0, 0, width, height, img.naturalWidth, img.naturalHeight)
@@ -1150,6 +1150,9 @@ function getTaskFailureMessage(payload: unknown) {
   if (!data || typeof data !== 'object') return normalizedMessage
   const failMsg = (data as { failMsg?: unknown }).failMsg
   const failCode = (data as { failCode?: unknown }).failCode
+  if (typeof failMsg === 'string' && failMsg && typeof failCode === 'string' && failCode) {
+    return `${failCode}: ${failMsg}`
+  }
   if (typeof failMsg === 'string' && failMsg) return failMsg
   if (typeof failCode === 'string' && failCode) return failCode
   if (normalizedMessage) return normalizedMessage
@@ -1194,8 +1197,19 @@ async function requestImageTask(imageDataUrl: string, resolution: UpscaleResolut
   return taskId
 }
 
+function createUpscalePrompt(resolution: UpscaleResolution) {
+  return [
+    `将当前图片分辨度提升到 ${resolution.toUpperCase()}。`,
+    '不要扩图，保持原图比例生图。',
+    '必须保持原图完整画面、原图边界、原图裁切范围、原图构图和主体位置完全不变。',
+    '不要横向拉伸，不要纵向拉伸，不要压扁人物，不要改变人物比例。',
+    '不要向左、右、上、下增加任何新内容，不要添加边框、白边、背景或画布外延。',
+    '只提升细节、锐度、质感和印刷分辨率。'
+  ].join(' ')
+}
+
 async function requestUpscaleTask(file: UploadedFile, resolution: UpscaleResolution) {
-  return requestImageTask(file.preview, resolution)
+  return requestImageTask(file.preview, resolution, createUpscalePrompt(resolution), '3:4')
 }
 
 async function waitForUpscaleResult(taskId: string, onStatus?: (message: string) => void) {
@@ -1216,6 +1230,10 @@ async function waitForUpscaleResult(taskId: string, onStatus?: (message: string)
       const failure = getTaskFailureMessage(payload)
       consecutiveErrors = 0
 
+      if (failure) {
+        throw new Error(`AI 任务失败：${failure}`)
+      }
+
       if (state === 'success') {
         const resultUrl = parseResultUrl(payload)
         if (!resultUrl) throw new Error('高清图片已生成，但未返回图片地址。')
@@ -1223,14 +1241,14 @@ async function waitForUpscaleResult(taskId: string, onStatus?: (message: string)
         return resultUrl
       }
       if (['failed', 'fail', 'error', 'canceled', 'cancelled'].includes(state)) {
-        throw new Error(failure ? `高清图片生成失败：${failure}` : '高清图片生成失败，请稍后重试。')
-      }
-      if (failure && state !== 'processing') {
-        throw new Error(`高清图片生成失败：${failure}`)
+        throw new Error('高清图片生成失败，请稍后重试。')
       }
 
       onStatus?.(state ? `任务状态：${state}，${UPSCALE_POLL_INTERVAL_MS / 1000} 秒后继续查询。` : `${UPSCALE_POLL_INTERVAL_MS / 1000} 秒后继续查询。`)
     } catch (error) {
+      if (error instanceof Error && error.message.startsWith('AI 任务失败：')) {
+        throw error
+      }
       consecutiveErrors += 1
       if (consecutiveErrors >= UPSCALE_MAX_CONSECUTIVE_POLL_ERRORS) {
         throw error
@@ -1324,6 +1342,8 @@ async function generateUpscaledImage() {
     isUpscaleModalOpen.value = false
   } catch (error) {
     upscaleError.value = error instanceof Error ? error.message : '高清图片生成失败，请稍后重试。'
+    upscaleTaskId.value = ''
+    upscalePollingStatus.value = ''
   }
 
   if (!upscaleError.value) {
@@ -1637,6 +1657,8 @@ async function generateAiBleedImage() {
     initializeAiCrop()
   } catch (error) {
     bleedGenerationError.value = error instanceof Error ? error.message : 'AI 智能扩图失败，请稍后重试。'
+    bleedTaskId.value = ''
+    bleedPollingStatus.value = ''
   }
 
   isGeneratingBleed.value = false
